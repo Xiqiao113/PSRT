@@ -1,0 +1,332 @@
+# Xiqiao Zhang
+# 2024/5/20
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.patches import Polygon
+import casadi as ca
+import time
+from casadi import *
+from matplotlib.patches import Rectangle
+import matplotlib.transforms as transforms
+
+T = 0.2
+N = 15
+rob_length = 0.15
+rob_diam = 0.1
+P_T = 1
+
+v_max = 0.6
+v_min = -0.6
+omega_max = pi / 4
+omega_min = - omega_max
+
+main_loop_start = time.time()
+
+x = SX.sym('x')
+y = SX.sym('y')
+theta = SX.sym('theta')
+states = vertcat(x, y, theta)  # Create the state vector
+n_states = states.size1()  # Calculate the length of the state vector
+
+v_des = SX.sym('v_des')
+omega_des = SX.sym('omega_des')
+controls = vertcat(v_des, omega_des)  # Create the control vector
+n_controls = controls.size1()
+
+
+v_actual = SX.sym('v_actual')
+omega_actual = SX.sym('omega_actual')
+
+rhs = vertcat(v_actual * cos(theta), v_actual * sin(theta), omega_actual)
+
+f = Function('f', [states, controls, v_actual, omega_actual], [rhs])  # Define the dynamic equation
+U = SX.sym('U', n_controls, N)  # Control variables (2, N)
+X = SX.sym('X', n_states, N+1)  # State variables（3， N+1）
+P = SX.sym('P', n_states + n_states)  # Initial state and reference state parameters
+
+v_current = 0
+omega_current = 0
+g = []# Constraints vector
+obj = 0
+# State and control weighting matrices
+Q = DM.zeros(3,3)
+Q[0,0] = 1; Q[1,1] = 5; Q[2,2] = 0.1
+
+R = DM.zeros(2,2)
+R[0,0] = 0.5; R[1,1] = 0.05
+
+
+x0 = X[:, 0]
+g.append(x0 - P[:3])
+
+for k in range(N):
+    st = X[:, k]
+    con = U[:, k]
+    obj += dot(st - P[3:6], Q @ (st - P[3:6])) + dot(con, R @ con)
+
+    v_des_val = U[0, k]
+    omega_des_val = U[1, k]
+
+    # Update the actual output of the actuators
+    v_current += T / P_T * (v_des_val - v_current)
+    omega_current += T / P_T * (omega_des_val - omega_current)
+
+
+    # Update the state with RK4
+    sta = X[:, k]
+    k1 = f(sta, vertcat(v_des_val, omega_des_val), v_current, omega_current)
+    k2 = f(sta + T / 2 * k1, vertcat(v_des_val, omega_des_val), v_current, omega_current)
+    k3 = f(sta + T / 2 * k2, vertcat(v_des_val, omega_des_val), v_current, omega_current)
+    k4 = f(sta + T * k3, vertcat(v_des_val, omega_des_val), v_current, omega_current)
+    sta_new = X[:, k+1]
+    sta_new_pre = sta + T / 6 * (k1 + 2 * k2 + 2 * k3 + k4)
+    g.append(sta_new - sta_new_pre)  # Equality constraints
+
+g = ca.vertcat(*g)
+
+# Convert the decision variables into a one-dimensional vector
+OPT_variables = ca.vertcat(
+    X.reshape((-1, 1)),
+    U.reshape((-1, 1))
+)
+print("Shape of OPT:", OPT_variables.shape)
+
+# Construct the NLP problem
+nlp_prob = {'f': obj, 'x': OPT_variables, 'g': g, 'p': P}
+
+opts = {
+    'ipopt': {
+        'max_iter': 2000,
+        'print_level': 0,  # Ipopt output level: 0, which means no output
+        'acceptable_tol': 1e-8,
+        'acceptable_obj_change_tol': 1e-6
+    },
+    'print_time': 0
+}
+
+# Create an instance of the solver
+solver = nlpsol('solver', 'ipopt', nlp_prob, opts)
+
+
+# Define solver parameters and constraint boundaries
+args = {
+    'lbg': ca.DM.zeros((n_states*(N+1), 1)),  # Equality constraints
+    'ubg': ca.DM.zeros((n_states*(N+1), 1)),
+    'lbx': [None]*(3*(N+1) + 2*N),  # Initialize as a list of size 2*N
+    'ubx': [None]*(3*(N+1) + 2*N)
+}
+
+for i in range(3*(N+1)):
+    if i % 3 == 0:
+        args['lbx'][i] = -3  # Lower bounds for state variables x
+        args['ubx'][i] = 3   # Upper bounds for state variables x
+    elif i % 3 == 1:
+        args['lbx'][i] = -3  # Lower bounds for state variables y
+        args['ubx'][i] = 3   # Upper bounds for state variables y
+    elif i % 3 == 2:
+        args['lbx'][i] = -np.inf  # Lower bounds for state variables theta
+        args['ubx'][i] = np.inf   # Upper bounds for state variables theta
+
+# Set the boundaries for control inputs: even indices for v, odd indices for omega
+for i in range(3*(N+1), 3*(N+1) + 2*N):
+    if i % 2 == 0:
+        args['lbx'][i] = v_min
+        args['ubx'][i] = v_max
+    else:
+        args['lbx'][i] = omega_min
+        args['ubx'][i] = omega_max
+
+
+def shift(T, t0, x0, u, f, v_current, omega_current):
+    """
+            Shift the simulation state forward by one time step.
+
+            Parameters:
+            T (float): Sampling time step.
+            t0 (float): Current time.
+            x0 (numpy.ndarray): Current state vector.
+            u (numpy.ndarray): Current control inputs.
+            f (function): Function to compute the right-hand side of the system dynamics.
+
+            Returns:
+            tuple: Updated time, state, and control inputs.
+            """
+    st = np.copy(x0)
+    con = u[0, :]  # Assuming u is a 2D array with controls in rows.
+
+    # Update the actuator state
+    v_des, omega_des = con[0], con[1]
+    v_current += T / P_T * (v_des - v_current)
+    omega_current += T / P_T * (omega_des - omega_current)
+
+
+    # Calculate system dynamics
+    f_value = f(np.array(st), np.array([v_current, omega_current]), v_current, omega_current)
+    if isinstance(f_value, SX) or isinstance(f_value, MX):
+        f_value = DM(f_value).full()
+
+    st += T * f_value
+
+    x0 = st
+    t0 += T
+    u0 = np.vstack([u[1:], u[-1, :]])  # Update control inputs
+
+    return t0, x0, u0, v_current, omega_current
+
+# ==============================================================================================
+t0 = 0
+v_current = 0
+omega_current = 0
+x0 = np.array([0, 0, 0.0])  # Initial state
+xs = np.array([2.5, 2.5, 0])  # Reference position
+sim_tim = 20  # Maximum simulation time
+mpciter = 0  # MPC iteration counter
+xx1 = []  # Array for storing all historical states
+u_cl = []  # Array for storing all historical control values
+
+# Initialize the state history array
+xx = np.zeros((3, int(sim_tim / T) + 1))
+xx[:, 0] = x0  # Set the initial state
+t = [t0]
+
+# Initialize optimization parameters
+X0 = ca.repmat(x0, 1, N+1).T
+u0 = np.zeros((N, 2))
+
+
+while norm_2(x0 - xs) > 1e-2 and mpciter < sim_tim / T:
+    p = vertcat(x0, xs)  # Set the parameter vector
+
+    # Reshape the initial optimization variables
+    x0_reshaped = ca.vertcat(
+        ca.reshape(X0.T, (3 * (N + 1), 1)),
+        ca.reshape(u0.T, (2 * N, 1))
+    )
+
+    sol = solver(x0=x0_reshaped, lbx=args['lbx'], ubx=args['ubx'], lbg=args['lbg'], ubg=args['ubg'], p=p)
+    # Obtain control inputs
+    u = np.reshape(sol['x'][3 * (N + 1):], (2, N)).T
+
+    current_trajectory = np.reshape(np.array(sol['x'][:3 * (N + 1)]), (3, N + 1)).T
+    x0_new = current_trajectory[0, :]
+
+    # Add predicted trajectory to the list
+    xx1.append(current_trajectory)
+    u_cl.append(u[0, :])
+    t.append(t0)
+
+    # Update u0
+    t0, x0, u0, v_current, omega_current = shift(T, t0, x0_new, u, f, v_current, omega_current)
+
+    # Update X0
+    X0 = np.reshape(sol['x'][:3 * (N + 1)].T, (3, N + 1)).T
+    X0 = np.vstack([X0[1:], X0[-1:]])
+
+    xx[:, mpciter + 1] = np.array(x0.full()).flatten()
+    mpciter += 1
+
+
+xx1 = np.array(xx1)  # (100 * 4 * 3)
+
+
+
+def Draw_MPC_point_stabilization_v1(t, xx, xx1, u_cl, xs, N):
+    plt.rcParams.update({'font.family': 'Times New Roman', 'font.size': 12})
+    line_width = 1.5
+    fontsize_labels = 14
+
+    # Ensure that u_cl is a NumPy array
+    if isinstance(u_cl, list):
+        u_cl = np.array(u_cl)
+
+    x_r_1 = []
+    y_r_1 = []
+
+    fig, ax = plt.subplots()
+    fig.patch.set_facecolor('white')
+    fig.set_size_inches(8, 8)
+    ax.set_aspect('equal', adjustable='box')
+
+
+    L = rob_length  # Length
+    W = rob_diam  # Width
+
+    # Size parameters of the triangle
+    triangle_size = W / 3
+    triangle_height = triangle_size * np.sqrt(3) / 2
+
+    for k in range(xx1.shape[0]):
+        ax.cla()
+
+        # Plot the reference position
+        x1, y1, th1 = xs[0], xs[1], xs[2]
+        ref_rect = Rectangle((x1 - L / 2, y1 - W / 2), L, W, color='green', fill=True)
+        t1 = transforms.Affine2D().rotate_around(x1, y1, th1) + ax.transData
+        ref_rect.set_transform(t1)
+        ax.add_patch(ref_rect)
+
+        # Plot the current position
+        x1, y1, th1 = xx[0, k], xx[1, k], xx[2, k]
+        x_r_1.append(x1)
+        y_r_1.append(y1)
+        rect = Rectangle((x1 - L / 2, y1 - W / 2), L, W, color='black', fill=True)
+        t2 = transforms.Affine2D().rotate_around(x1, y1, th1) + ax.transData
+        rect.set_transform(t2)
+        ax.add_patch(rect)
+
+        # Plot the direction triangle
+        triangle = [
+            (x1 + L / 2, y1),
+            (x1 + L / 2 - triangle_height, y1 - triangle_size / 2),
+            (x1 + L / 2 - triangle_height, y1 + triangle_size / 2)
+        ]
+        direction_triangle = Polygon(triangle, closed=True, color='red', fill=True)
+        t3 = transforms.Affine2D().rotate_around(x1, y1, th1) + ax.transData
+        direction_triangle.set_transform(t3)
+        ax.add_patch(direction_triangle)
+
+        # Plot the trajectory
+        ax.plot(x_r_1, y_r_1, '-k', linewidth=line_width)
+
+        # Plot the predicted trajectory
+        if k < xx1.shape[0]:
+            plt.plot(xx1[k, :N, 0], xx1[k, :N, 1], 'k--*')
+
+        ax.set_xlabel('$x$-position (m)', fontsize=fontsize_labels)
+        ax.set_ylabel('$y$-position (m)', fontsize=fontsize_labels)
+        ax.grid(True)
+        plt.pause(0.1)
+        plt.draw()
+
+    plt.close(fig)
+
+    min_length = min(len(t), u_cl.shape[0])
+    t = t[:min_length]
+    u_cl = u_cl[:min_length]
+
+    # Plot the control inputs
+    fig, (ax1, ax2) = plt.subplots(2, 1)
+    ax1.step(t, u_cl[:, 0], 'k', linewidth=line_width)  # 确保 u_cl 是二维的
+    ax1.set_ylabel('v (rad/s)')
+    ax1.grid(True)
+    ax1.set_xlim([0, t[-1]])
+    ax1.set_ylim([-0.35, 0.75])
+
+    ax2.step(t, u_cl[:, 1], 'r', linewidth=line_width)
+    ax2.set_xlabel('time (seconds)')
+    ax2.set_ylabel('\omega (rad/s)')
+    ax2.grid(True)
+    ax2.set_xlim([0, t[-1]])
+    ax2.set_ylim([-0.85, 0.85])
+
+    plt.show()
+
+
+
+
+main_loop_time = time.time() - main_loop_start
+ss_error = norm_2(x0 - xs)
+average_mpc_time = main_loop_time / (mpciter + 1)
+
+
+Draw_MPC_point_stabilization_v1(t, xx, xx1, u_cl, xs, N)
